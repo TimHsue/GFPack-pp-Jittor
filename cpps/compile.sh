@@ -1,0 +1,1 @@
+g++ main.cpp clipper.engine.cpp clipper.offset.cpp clipper.rectclip.cpp -o output -std=c++17 -O3
