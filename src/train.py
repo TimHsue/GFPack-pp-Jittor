@@ -1,80 +1,47 @@
-
 import copy
 import math
 import os
 import random
+from pathlib import Path
+
 import numpy as np
 from tqdm import trange
 import argparse
 import pickle
-import cv2
 import time
 
 import jittor as jt
 import jittor.optim as optim
-from jittor.dataset import DataLoader
-import matplotlib.pyplot as plt
-import numpy as np
-import shapely
-import shapely.geometry
-from shapely.geometry import Polygon
-from critic import PolygonPackingTransformer
-
-from tensorboardX import SummaryWriter
-import tools
 from types import SimpleNamespace
+import numpy as np
+
+import matplotlib.pyplot as plt
+
+from shapely.geometry import Polygon as ShapelyPolygon
+
+from .score_model import PolygonPackingTransformer
+
+from .utils import SummaryWriter
+
+from .utils import Polygon as PolygonGeometry
+from .utils import setRandomSeed
 
 
-from sde import init_sde, lossFun, pc_sampler_state, ExponentialMovingAverage
+from .sde import init_sde, lossFun, pc_sampler_state, ExponentialMovingAverage
 
 
-import calutil
-import rmspacing
+from . import calutil
+from . import rmspacing
 
-class GraphData:
-    """简单的图数据结构，仿 PyG 的 Data"""
-    def __init__(self, **kwargs):
-        for k,v in kwargs.items():
-            if isinstance(v, np.ndarray):
-                v = jt.array(v)
-            setattr(self, k, v)
 
-class GraphBatch(GraphData):
-    """把若干 GraphData 合并成 batch"""
-    @staticmethod
-    def from_data_list(data_list):
-        # x 按行拼接，edge_index 节点编号整体平移
-        xs, edge_indices = [], []
-        areas, perms = [], []
-        batch_idx = []
-        node_offset = 0
-        for i, g in enumerate(data_list):
-            n = g.x.shape[0]
-            xs.append(g.x)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+DATASET_DIR = DATA_DIR / "datasets"
+POLYGON_DIR = DATA_DIR / "polygons"
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+SNAPSHOT_DIR = CHECKPOINT_DIR / "snapshots"
+LOG_DIR = PROJECT_ROOT / "logs"
 
-            # 平移 edge_index
-            ei = g.edge_index + jt.array(node_offset)
-            edge_indices.append(ei)
-
-            areas.append(g.area)
-            perms.append(g.perm)
-
-            # 记录每个节点属于哪个图
-            batch_idx.append(jt.full((n,), i, dtype=jt.int32))
-
-            node_offset += n
-        x = jt.concat(xs, dim=0)
-        edge_index = jt.concat(edge_indices, dim=1)
-        area = jt.concat(areas, dim=0)
-        perm = jt.concat(perms, dim=0)
-        batch = jt.concat(batch_idx, dim=0)
-
-        return GraphBatch(x=x,
-                          edge_index=edge_index,
-                          area=area,
-                          perm=perm,
-                          batch=batch)
-    
 class gfppDataset(jt.dataset.Dataset):
     def __init__(self, actionsData, polyIdsData, paddingMaskData, weightsAll):
         super().__init__()
@@ -123,23 +90,21 @@ def cal_util(polys, pidsAll, actionsAll, eps=5.0):
     return util, valid, bbd, sum_inter_per
 
 def existsOrMkdir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-        return False
-    else:
-        return True
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return Path(path)
 
 def readAllPolys(polyCnt=440):
     polyVertices = []
     for i in range(0, polyCnt):
-        poly = tools.Polygon(f"../polys_new/{i}.txt")
+
+        poly_path = POLYGON_DIR / f"{i}.txt"
+        poly = PolygonGeometry(str(poly_path))
         maxContour = poly.getMaxContour()
         polyVertices.append(maxContour)
     
     return polyVertices
 
 def genPaddingMask(polyVerticesData):
-    inf = 1e9
     paddingMaskData = []
     for i in range(len(polyVerticesData)):
         paddingMask = []
@@ -162,7 +127,7 @@ def padData(polyIds, actions):
 
 def collectData():
     
-    dirName = "../dataset_dental_sp7_r_h12_new.pkl"
+    dirName = DATASET_DIR / "dataset_dental_sp7_r_h12_new.pkl"
     dataFile = open(dirName, "rb")
     print("load data from ", dirName)
     polyIds = pickle.load(dataFile)
@@ -189,7 +154,7 @@ def removeSpacing(polys, pidsAll, actionsAll, height):
     rm_begin = time.time()
     rm_translations = rmspacing.rm_spacing_all(pidsAll, thetasAll, copy.deepcopy(translationsAll), copy.deepcopy(polys), 8000.0, height, 1.0)
     rm_end = time.time()
-    print("rm_spacing time: ", rm_end - rm_begin)
+    
     newActionsAll = []
     for i in range(len(pidsAll)):
         newActions = []
@@ -201,7 +166,7 @@ def removeSpacing(polys, pidsAll, actionsAll, height):
 
 def collectValiData():
     
-    dirName = "../dataset_dental_vali_128.pkl"
+    dirName = DATASET_DIR / "dataset_dental_sp7_r_h12_vali.pkl"
     dataFile = open(dirName, "rb")
     print("load data from ", dirName)
     polyIds = pickle.load(dataFile)
@@ -238,41 +203,43 @@ def compute_node_features(poly):
     return node_features
 
 def compute_global_features(poly):
-    polygon = Polygon(poly)
+    polygon = ShapelyPolygon(poly)
     area = polygon.area
     perimeter = polygon.length
 
     return [area, perimeter]
         
 def create_gnn_data(polygons):
-    cum_node_count = 0 
-    
-    data_list = []
-    
-    for poly_index, poly in enumerate(polygons):
-        node_features = compute_node_features(poly)  # shape: (n, 3)
-        area, perm = compute_global_features(poly) # shape (2)
+    node_feats, edge_list, batch_idx, areas, perims = [], [], [], [], []
+    node_offset = 0
 
-        num_nodes = len(poly)
-        edge_indices = [(i, (i + 1) % num_nodes) for i in range(num_nodes)]
-        edge_indices += [((i + 1) % num_nodes, i) for i in range(num_nodes)]
-        # edge_indices = [(u + cum_node_count, v + cum_node_count) for u, v in edge_indices]
+    for g_idx, poly in enumerate(polygons):
+        feats = jt.float32(compute_node_features(poly))              # [n, 3]
+        num_nodes = feats.shape[0]
 
-        cum_node_count += num_nodes
+        edges = []
+        for i in range(num_nodes):
+            j = (i + 1) % num_nodes
+            edges.append([node_offset + i, node_offset + j])
+            edges.append([node_offset + j, node_offset + i])
+        edge_list.append(jt.int32(edges))
 
-        node_features_tensor = jt.float(node_features)
-        edge_index_tensor = jt.array(edge_indices).t().contiguous()
-        area_tensor = jt.float(area)
-        perm_tensor = jt.float(perm)
+        node_feats.append(feats)
+        batch_idx.append(jt.full([num_nodes], g_idx, dtype='int32'))
 
-        g = GraphData(x=node_features_tensor,
-            edge_index=edge_index_tensor,
-            area=area_tensor,
-            perm=perm_tensor)
-        data_list.append(g)
+        area, perm = compute_global_features(poly)
+        areas.append(jt.float32([area]))
+        perims.append(jt.float32([perm]))
 
-    batched_data = GraphBatch.from_data_list(data_list)
-    return batched_data
+        node_offset += num_nodes
+
+    x = jt.concat(node_feats, dim=0)                                 # [N, 3]
+    edge_index = jt.concat(edge_list, dim=0).transpose(1, 0)         # [2, E]
+    batch = jt.concat(batch_idx, dim=0)                              # [N]
+    area = jt.concat(areas, dim=0)                                   # [G, 1]
+    perm = jt.concat(perims, dim=0)                                  # [G, 1]
+
+    return SimpleNamespace(x=x, edge_index=edge_index, batch=batch, area=area, perm=perm)
 
 
 def rotatePoly(poly, theta):
@@ -388,14 +355,14 @@ def vali_res(valiPolyIds, polyVertices, valiActions, paddingMaskData, predict):
                 best_util = rm_util[i]
                 best_id = i
                 
-    gdvalid, gdUtil, gdIntersectedArea = valid[-1], util[-1], sum_inter_per[-1]
+    gt_util = util[-1]
     
     if len(rm_vali_util_list) == 0:
         rm_vali_util_list.append(0)
     if len(before_vali_util_list) == 0:
         before_vali_util_list.append(0)    
     
-    return before_vali_cnt, rm_vali_cnt, gdUtil, before_intersec_area_list, intersec_area_list, before_vali_util_list, rm_vali_util_list, rm_predict, best_id, rm_predict[-1], rm_time
+    return before_vali_cnt, rm_vali_cnt, gt_util, before_intersec_area_list, intersec_area_list, before_vali_util_list, rm_vali_util_list, rm_predict, best_id, rm_predict[-1], rm_time
 
 def vali_all(id_list, action_list, padding_list, score, sde_fn, gnnFeatureData, polyVertices):
     
@@ -427,7 +394,7 @@ def vali_all(id_list, action_list, padding_list, score, sde_fn, gnnFeatureData, 
             gen_time_end = time.time()
         total_gen_time += gen_time_end - gen_time_begin
         
-        before_vali_cnt, rm_vali_cnt, gdUtil, \
+        before_vali_cnt, rm_vali_cnt, gt_util, \
         before_intersec_area_list, rm_intersec_area_list, \
         before_vali_util_list, rm_vali_util_list, \
         rm_predict, best_util_id, rm_vali_actions, \
@@ -460,7 +427,6 @@ def vali_all(id_list, action_list, padding_list, score, sde_fn, gnnFeatureData, 
             float(bef_sum_util_all), float(bef_wrst_util_all), float(bef_best_util_all), \
             float(total_gen_time), float(total_rm_time)
     
-
 if __name__ == '__main__':
     print("hi")
     parser = argparse.ArgumentParser()
@@ -480,8 +446,8 @@ if __name__ == '__main__':
     
     parser.add_argument('--n_epochs', type=int, default=1000000)
     parser.add_argument('--visualize_freq', type=int, default=64)
-    parser.add_argument('--vali_freq', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--vali_freq', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=3407)
     # load args
@@ -491,16 +457,16 @@ if __name__ == '__main__':
     beginEpoch = args.beginEpoch
     # n, m, x, y = args.n, args.m, args.x, args.y
     
-    tools.setRandomSeed(args.seed)
+    setRandomSeed(args.seed)
     
     jt.flags.use_cuda = 1
 
-    existsOrMkdir('./logs')
-    tb_path = f'./logs/{args.log_dir}/train'
+    existsOrMkdir(LOG_DIR)
+    tb_path = LOG_DIR / args.log_dir / "train"
     existsOrMkdir(tb_path)
-    model_path = f'./models'
-    existsOrMkdir(model_path)
-    writer = SummaryWriter(tb_path, "base")
+    existsOrMkdir(CHECKPOINT_DIR)
+    existsOrMkdir(SNAPSHOT_DIR)
+    writer = SummaryWriter(str(tb_path))
     print("reading polys...")
     polyVertices = readAllPolys(440)
     gnnFeatureData = create_gnn_data(polyVertices)
@@ -509,7 +475,7 @@ if __name__ == '__main__':
     for polyVertex in polyVertices:
         polyVertexNumbers.append(len(polyVertex))
         
-    print("loading expert...")
+    print("loading teacher...")
     polyIdsDataAll, actionsDataAll, paddingMaskDataAll = collectData()
 
     allDataSize = len(polyIdsDataAll)
@@ -532,33 +498,39 @@ if __name__ == '__main__':
     ''' Init Model '''
     
     score = PolygonPackingTransformer(marginal_prob_std_func=marginal_prob_fn)
-    score.load(f"critic.pkl")      # 从jittor模型加载参数
-    # score.load("critic.pth")       # 从pytorch模型加载参数
+    checkpoint_path = CHECKPOINT_DIR / "score_model.pth"
+    checkpoint_pickle_path = CHECKPOINT_DIR / "score_model.pkl"
+    if checkpoint_path.exists():
+        score.load(str(checkpoint_pickle_path))
+        print(f"Loaded pretrained weights from {checkpoint_path}")
+    else:
+        print(f"No pretrained checkpoint found at {checkpoint_path}, initializing from scratch.")
 
-    for param in score.parameters():
-        if hasattr(param, 'requires_grad'):
-            param.requires_grad = True
-    for name, param in score.named_parameters():
-        if 't_embed.0.W' in name:
-            param.requires_grad = False
-            # print(f"✓ 设置为不可训练: {name}")
-    '''
-    print("\n" + "="*60)
-    print("检查模型初始化后的参数状态:")
-    print("="*60)
-    trainable_count = 0
-    frozen_count = 0
-    for name, param in score.named_parameters():
-        if param.requires_grad:
-            trainable_count += 1
-            print(f"✓ {name:60s} trainable")
-        else:
-            frozen_count += 1
-            print(f"✗ {name:60s} FROZEN")
 
-    print(f"\nTrainable: {trainable_count}, Frozen: {frozen_count}")
-    print("="*60 + "\n")
-    '''
+    # for param in score.parameters():
+    #     if hasattr(param, 'requires_grad'):
+    #         param.requires_grad = True
+    # for name, param in score.named_parameters():
+    #     if 't_embed.0.W' in name:
+    #         param.requires_grad = False
+    #         # print(f"✓ 设置为不可训练: {name}")
+    
+    # print("\n" + "="*60)
+    # print("检查模型初始化后的参数状态:")
+    # print("="*60)
+    # trainable_count = 0
+    # frozen_count = 0
+    # for name, param in score.named_parameters():
+    #     if param.requires_grad:
+    #         trainable_count += 1
+    #         print(f"✓ {name:60s} trainable")
+    #     else:
+    #         frozen_count += 1
+    #         print(f"✗ {name:60s} FROZEN")
+
+    # print(f"\nTrainable: {trainable_count}, Frozen: {frozen_count}")
+    # print("="*60 + "\n")
+    
 
     paramToLearn =  list(filter(lambda p: p.requires_grad, score.parameters()))
     optimizer = optim.AdamW(paramToLearn, lr=args.lr, weight_decay=1e-4)
@@ -585,6 +557,7 @@ if __name__ == '__main__':
         totLoss = 0
         totDelta = 0
         totLen = 0
+
         
         for i, choosedData in enumerate(dataloader):
             nowLoss = 0
@@ -597,7 +570,7 @@ if __name__ == '__main__':
                 w=choosedData[3].reshape([-1]),
                 batch=jt.arange(batch_size).unsqueeze(1).repeat(1, seq_len).reshape(-1)
             )
-            
+            # print('gnnFeatureData', gnnFeatureData.x.shape, gnnFeatureData.edge_index.shape, gnnFeatureData.batch.shape, gnnFeatureData.area.shape, gnnFeatureData.perm.shape)
             for _ in range(args.repeat_num):
                 # calc score-matching loss
                 loss, delta = lossFun(score, state, gnnFeatureData, marginal_prob_fn)
@@ -619,44 +592,31 @@ if __name__ == '__main__':
                 for g in optimizer.param_groups:
                     g['lr'] = args.lr * np.minimum(curIndex / args.warmup, 1.0)
             
-            '''
-            for name, param in score.named_parameters():
-                if param.requires_grad:
-                    # print(f"Parameter: {name}")
-                    try:
-                        grad = optimizer.find_grad(param)
-                        grad_norm = grad.norm().item()
-                        # print(f"{name}: {grad_norm:.6f}")
-                    except:
-                        print(f"{name}: No gradient")
-                else:
-                    print(f"Parameter: {name} does not require grad.")
-            '''
+            
+            # for name, param in score.named_parameters():
+            #     if not param.requires_grad:
+            #         print(f"Parameter: {name} does not require grad.")
+            #         continue
+
+            #     grad = optimizer.find_grad(param)
+            #     if grad is None:
+            #         print(f"{name}: no gradient")
+            #         continue
+
+            #     grad_norm = float(jt.sqrt((grad * grad).sum()).item())
+            #     print(f"{name}: {grad_norm:.6f}")
 
             # grad clip
             if args.grad_clip >= 0:
                 optimizer.clip_grad_norm(max_norm=args.grad_clip)
             
             optimizer.step()
-
             
             ema.update(score.parameters())
             
             if args.ema_rate > 0 and curIndex % 8 == 0:
                 ema.store(score.parameters())
                 ema.copy_to(score.parameters())
-                '''
-                with jt.no_grad():
-                    nowLoss = 0
-
-                    for _ in range(1):
-                        # calc score-matching loss
-                        loss, delta = lossFun(score, choosedData, gnnFeatureData, marginal_prob_fn)
-                        nowLoss += loss
-                    nowLoss /= 1
-                    if localRank == 0:
-                        writer.add_scalars('train/train_loss', {'ema': nowLoss}, curIndex)
-                '''
                 ema.restore(score.parameters())
             curIndex += 1
             
@@ -664,10 +624,11 @@ if __name__ == '__main__':
         print("Epoch: {}, Loss: {}, Delta: {}".format(epoch, totLoss / totLen, totDelta / totLen))
         
         if (epoch) % 2 == 0:
-            score.save(f"critic.pkl")
+            score.save(str(checkpoint_pickle_path))
 
         if (epoch) % args.vali_freq == 0:
-            score.save(f"models/critic{epoch}.pkl")
+            snapshot_pickle = SNAPSHOT_DIR / f"score_model_epoch{epoch}.pkl"
+            score.save(str(snapshot_pickle))
 
         if (epoch + 1) % args.vali_freq == 0:
 
@@ -706,18 +667,42 @@ if __name__ == '__main__':
             print("total_gen_time=%f total_rm_time=%f" % (total_gen_time, total_rm_time))
             print("-------------------------------")
             
-            writer.add_scalars('valiall/validCnt', {'rm': rm_vali_cnt_all}, epoch)
-            writer.add_scalars('valiall/util', {'rm': rm_sum_util_all}, epoch)
-            writer.add_scalars('valiall/util', {'rmWrst': rm_wrst_util_all}, epoch)
-            writer.add_scalars('valiall/util', {'rmBest': rm_best_util_all}, epoch)
-            writer.add_scalars('valiall/area', {'bef': before_sum_inter_all}, epoch)
-            writer.add_scalars('valiall/area', {'befWrst': before_wrst_inter_all}, epoch)
-            writer.add_scalars('valiall/validCnt', {'bef': before_vali_cnt_all}, epoch)
-            writer.add_scalars('valiall/util', {'bef': bef_sum_util_all}, epoch)
-            writer.add_scalars('valiall/util', {'befWrst': bef_wrst_util_all}, epoch)
-            writer.add_scalars('valiall/util', {'befBest': bef_best_util_all}, epoch)
-            writer.add_scalars('valiall/time', {'gen': total_gen_time}, epoch)
-            writer.add_scalars('valiall/time', {'rm': total_rm_time}, epoch)
+            writer.add_scalars(
+                'valiall/validCnt',
+                {
+                    'rm': rm_vali_cnt_all,
+                    'bef': before_vali_cnt_all,
+                },
+                epoch,
+            )
+            writer.add_scalars(
+                'valiall/util',
+                {
+                    'rm': rm_sum_util_all,
+                    'rmWrst': rm_wrst_util_all,
+                    'rmBest': rm_best_util_all,
+                    'bef': bef_sum_util_all,
+                    'befWrst': bef_wrst_util_all,
+                    'befBest': bef_best_util_all,
+                },
+                epoch,
+            )
+            writer.add_scalars(
+                'valiall/area',
+                {
+                    'bef': before_sum_inter_all,
+                    'befWrst': before_wrst_inter_all,
+                },
+                epoch,
+            )
+            writer.add_scalars(
+                'valiall/time',
+                {
+                    'gen': total_gen_time,
+                    'rm': total_rm_time,
+                },
+                epoch,
+            )
                 
         
         if (epoch) % args.visualize_freq == 0:
@@ -731,13 +716,13 @@ if __name__ == '__main__':
             with jt.no_grad():
                 samples, res = pc_sampler_state(score, sde_fn, len(valiPolyIds), valiPolyIds, gnnFeatureData, paddingMaskData)
             
-            before_vali_cnt, rm_vali_cnt, gdUtil, \
+            before_vali_cnt, rm_vali_cnt, gt_util, \
             before_intersec_area_list, intersec_area_list, \
             before_vali_util_list, rm_vali_util_list, \
             rm_predict, best_util_id, rm_vali_action,\
             rm_time = vali_res(valiPolyIds, polyVertices, valiActions, paddingMaskData, res)
             
-            print('vis')
+            # print('vis')
             visualize(epoch, valiPolyIds, polyVertices, rm_vali_action, paddingMaskData, writer, "gd")
             visualize(epoch, valiPolyIds, polyVertices, rm_predict[best_util_id], paddingMaskData, writer, "pr")
             
@@ -758,18 +743,33 @@ if __name__ == '__main__':
             print("rm_best_util=%f rm_avg_util=%f rm_wrst_util=%f" % (rm_best_util, rm_avg_util, rm_wrst_util))
             print("before_vali_cnt=%d rm_vali_cnt=%d" % (before_vali_cnt, rm_vali_cnt))
             
-            writer.add_scalars('vali/util', {'PRBst': rm_best_util}, epoch)
-            writer.add_scalars('vali/util', {'PRAvg': rm_avg_util}, epoch)
-            writer.add_scalars('vali/util', {'PRWrst': rm_wrst_util}, epoch)
-            
-            writer.add_scalars('vali/area', {'PRBst': before_best_inter}, epoch)
-            writer.add_scalars('vali/area', {'PRAvg': before_avg_inter}, epoch)
-            writer.add_scalars('vali/area', {'PRwrst': before_wrst_inter}, epoch)
-            
-            writer.add_scalars('vali/util', {'GD': gdUtil}, epoch)
-            
-            writer.add_scalars('vali/validCnt', {'bef': before_vali_cnt}, epoch)
-            writer.add_scalars('vali/validCnt', {'aft': rm_vali_cnt}, epoch)
+            writer.add_scalars(
+                'vali/util',
+                {
+                    'PRBst': rm_best_util,
+                    'PRAvg': rm_avg_util,
+                    'PRWrst': rm_wrst_util,
+                    'GD': gt_util,
+                },
+                epoch,
+            )
+            writer.add_scalars(
+                'vali/area',
+                {
+                    'PRBst': before_best_inter,
+                    'PRAvg': before_avg_inter,
+                    'PRWrst': before_wrst_inter,
+                },
+                epoch,
+            )
+            writer.add_scalars(
+                'vali/validCnt',
+                {
+                    'bef': before_vali_cnt,
+                    'aft': rm_vali_cnt,
+                },
+                epoch,
+            )
 
 
     writer.close()

@@ -6,6 +6,13 @@ import jittor.nn as F
 import matplotlib.pyplot as plt
 import cv2 as cv
 import numpy as np
+import io
+import os
+import time
+from typing import Any, Dict, Optional
+from tensorboard.compat.proto import event_pb2, summary_pb2
+from tensorboard.summary.writer.event_file_writer import EventFileWriter
+
 
 
 class Line:
@@ -712,3 +719,165 @@ if __name__ == "__main__":
     # sweepLine = SweepLine(poly.mainContour)
     # sweepLine.solve(200, 200, 192, 120)
     '''
+
+def _to_number(value: Any) -> float:
+    """Best-effort conversion of numeric-like values to Python floats."""
+    if hasattr(value, "item"):
+        try:
+            return float(value.item())
+        except TypeError:
+            pass
+    return float(value)
+
+
+class SummaryWriter:
+    """A lightweight TensorBoard writer compatible with tensorboardX API."""
+
+    def __init__(
+        self,
+        log_dir: str,
+        comment: Optional[str] = None,
+        max_queue: int = 10,
+        flush_secs: int = 2,
+        filename_suffix: str = "",
+    ) -> None:
+        if not isinstance(log_dir, str):
+            raise TypeError("log_dir must be a string path")
+
+        effective_dir = log_dir
+        if comment:
+            effective_dir = os.path.join(log_dir, comment)
+
+        os.makedirs(effective_dir, exist_ok=True)
+
+        self._base_dir = effective_dir
+        self._max_queue = max_queue
+        self._flush_secs = flush_secs
+        self._filename_suffix = filename_suffix
+        self._writers: Dict[str, EventFileWriter] = {}
+        self._closed = False
+
+    def _normalize_relative_path(self, relative: Optional[str]) -> str:
+        if not relative:
+            return ""
+        pieces = []
+        for part in str(relative).replace("\\", "/").split('/'):
+            if part:
+                pieces.append(part)
+        return "/".join(pieces)
+
+    def _get_writer(self, relative: Optional[str] = None) -> EventFileWriter:
+        if self._closed:
+            raise RuntimeError("SummaryWriter is closed")
+
+        key = self._normalize_relative_path(relative)
+        if key in self._writers:
+            return self._writers[key]
+
+        if key:
+            target_dir = os.path.join(self._base_dir, *key.split('/'))
+        else:
+            target_dir = self._base_dir
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        writer = EventFileWriter(
+            target_dir,
+            max_queue_size=self._max_queue,
+            flush_secs=self._flush_secs,
+            filename_suffix=self._filename_suffix,
+        )
+        self._writers[key] = writer
+        return writer
+
+    def _write_summary(self, writer: EventFileWriter, summary, global_step: Optional[int]) -> None:
+        event = event_pb2.Event(wall_time=time.time(), summary=summary)
+        if global_step is not None:
+            event.step = int(global_step)
+        writer.add_event(event)
+
+    def add_scalar(self, tag: str, scalar_value: Any, global_step: Optional[int] = None) -> None:
+        value = _to_number(scalar_value)
+        summary = summary_pb2.Summary(
+            value=[summary_pb2.Summary.Value(tag=tag, simple_value=value)]
+        )
+        writer = self._get_writer("")
+        self._write_summary(writer, summary, global_step)
+
+    def add_scalars(
+        self,
+        main_tag: str,
+        tag_scalar_dict: Dict[str, Any],
+        global_step: Optional[int] = None,
+    ) -> None:
+        for sub_tag, scalar in tag_scalar_dict.items():
+            run_path = self._normalize_relative_path(main_tag)
+            if sub_tag:
+                run_path = self._normalize_relative_path(f"{run_path}/{sub_tag}") if run_path else self._normalize_relative_path(sub_tag)
+            writer = self._get_writer(run_path)
+            value = _to_number(scalar)
+            summary = summary_pb2.Summary(
+                value=[summary_pb2.Summary.Value(tag=main_tag, simple_value=value)]
+            )
+            self._write_summary(writer, summary, global_step)
+
+    def add_figure(
+        self,
+        tag: str,
+        figure,
+        global_step: Optional[int] = None,
+        close: bool = True,
+    ) -> None:
+        """Log a matplotlib figure as an image summary."""
+        if figure is None:
+            raise ValueError("figure must not be None")
+
+        figure.canvas.draw()
+        width, height = figure.canvas.get_width_height()
+
+        buffer = io.BytesIO()
+        figure.savefig(buffer, format="png")
+        buffer.seek(0)
+
+        image = summary_pb2.Summary.Image(
+            encoded_image_string=buffer.getvalue(),
+            width=width,
+            height=height,
+            colorspace=3,
+        )
+        summary = summary_pb2.Summary(
+            value=[summary_pb2.Summary.Value(tag=tag, image=image)]
+        )
+        writer = self._get_writer("")
+        self._write_summary(writer, summary, global_step)
+
+        if close:
+            figure.clf()
+        buffer.close()
+
+    def flush(self) -> None:
+        if self._closed:
+            return
+        for writer in self._writers.values():
+            writer.flush()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for writer in self._writers.values():
+            writer.flush()
+            writer.close()
+        self._writers.clear()
+        self._closed = True
+
+    def __enter__(self) -> "SummaryWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
