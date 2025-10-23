@@ -506,32 +506,6 @@ if __name__ == '__main__':
     else:
         print(f"No pretrained checkpoint found at {checkpoint_path}, initializing from scratch.")
 
-
-    # for param in score.parameters():
-    #     if hasattr(param, 'requires_grad'):
-    #         param.requires_grad = True
-    # for name, param in score.named_parameters():
-    #     if 't_embed.0.W' in name:
-    #         param.requires_grad = False
-    #         # print(f"✓ 设置为不可训练: {name}")
-    
-    # print("\n" + "="*60)
-    # print("检查模型初始化后的参数状态:")
-    # print("="*60)
-    # trainable_count = 0
-    # frozen_count = 0
-    # for name, param in score.named_parameters():
-    #     if param.requires_grad:
-    #         trainable_count += 1
-    #         print(f"✓ {name:60s} trainable")
-    #     else:
-    #         frozen_count += 1
-    #         print(f"✗ {name:60s} FROZEN")
-
-    # print(f"\nTrainable: {trainable_count}, Frozen: {frozen_count}")
-    # print("="*60 + "\n")
-    
-
     paramToLearn =  list(filter(lambda p: p.requires_grad, score.parameters()))
     optimizer = optim.AdamW(paramToLearn, lr=args.lr, weight_decay=1e-4)
     # create the dataset
@@ -592,20 +566,6 @@ if __name__ == '__main__':
                 for g in optimizer.param_groups:
                     g['lr'] = args.lr * np.minimum(curIndex / args.warmup, 1.0)
             
-            
-            # for name, param in score.named_parameters():
-            #     if not param.requires_grad:
-            #         print(f"Parameter: {name} does not require grad.")
-            #         continue
-
-            #     grad = optimizer.find_grad(param)
-            #     if grad is None:
-            #         print(f"{name}: no gradient")
-            #         continue
-
-            #     grad_norm = float(jt.sqrt((grad * grad).sum()).item())
-            #     print(f"{name}: {grad_norm:.6f}")
-
             # grad clip
             if args.grad_clip >= 0:
                 optimizer.clip_grad_norm(max_norm=args.grad_clip)

@@ -10,7 +10,6 @@ from jittor_geometric.ops import cootocsr,cootocsc
 from jittor_geometric.nn.conv.gcn_conv import gcn_norm
 
 from jittor_geometric.nn import GCNConv
-# from torch_geometric.nn import GCNConv, global_mean_pool
 
 import jittor as jt
 
@@ -33,12 +32,6 @@ def bincount(input, weights=None, minlength=0):
         return one_hot.sum(dim=0)
 
 def segment_sum(data, segment_ids, num_segments):
-    """
-    data: [N, F]
-    segment_ids: [N]，每个元素是 [0, num_segments-1] 的整数
-    num_segments: int，输出的 segment 数
-    返回: [num_segments, F]
-    """
     segment_ids = segment_ids.int32()
     out = jt.zeros([num_segments, data.shape[1]], dtype=data.dtype)
     out = out.index_add_(0, segment_ids, data)
@@ -55,17 +48,10 @@ class AttentionPooling(nn.Module):
     def execute(self, x, key_padding_mask=None):
         # x shape: [batch_size, seq_len, input_dim]
         # key_padding_mask shape: [batch_size, seq_len]
-        
-        # Reshape x to [seq_len, batch_size, input_dim]
         x = x.transpose(0, 1)
-        
         batch_size = x.shape[1]
-        # query shape: [1, batch_size, input_dim]
         query = self.query.repeat(1, batch_size, 1)
-        
-        # key_padding_mask shape: [batch_size, seq_len]
         attn_output, _ = self.attn(query, x, x, key_padding_mask=key_padding_mask)
-        # attn_output shape: [1, batch_size, output_dim]
         
         # Reshape output to [batch_size, output_dim]
         return attn_output.squeeze(0)
@@ -185,42 +171,8 @@ class Transformer(nn.Module):
                              memory_key_padding_mask=memory_key_padding_mask)
         return output
 
-# def repeat_interleave(input, repeats, dim=None):
-#     if dim is None:
-#         input = input.reshape(-1)
-#         dim = 0
-    
-#     if dim < 0:
-#         dim = len(input.shape) + dim
-    
-#     if isinstance(repeats, int):
-#         indices = []
-#         for i in range(input.shape[dim]):
-#             indices.extend([i] * repeats)
-#     else:
-#         if isinstance(repeats, jt.Var):
-#             repeats_list = jt.tolist(repeats)
-#         elif hasattr(repeats, 'tolist'):
-#             repeats_list = repeats.tolist()
-#         else:
-#             repeats_list = list(repeats)
-        
-#         indices = []
-#         for i, r in enumerate(repeats_list):
-#             indices.extend([i] * int(r))
-    
-#     indices_tensor = jt.array(indices, dtype='int32')
-    
-#     full_indices = [slice(None)] * len(input.shape)
-#     full_indices[dim] = indices_tensor
-    
-#     return input[tuple(full_indices)]
 
 def repeat_interleave(input, repeats, dim=0):
-    """
-    Jittor-native implementation of repeat_interleave that is fully differentiable
-    and does not rely on jt.Var.repeat(tensor), which is not supported.
-    """
     if dim is None:
         input = input.reshape(-1)
         dim = 0
@@ -235,24 +187,12 @@ def repeat_interleave(input, repeats, dim=0):
         if repeats_var.ndim != 1 or repeats_var.shape[0] != input.shape[dim]:
             raise ValueError(f"repeats length must match input.shape[dim]. Got {repeats_var.shape[0]} and {input.shape[dim]}.")
 
-    # Create an index tensor for gathering
-    # Example: input.shape[dim]=3, repeats=[2,1,3]
-    # arange -> [0, 1, 2]
-    # This part needs a Jittor-native way to repeat elements of a tensor by counts in another tensor.
-    # We can do this by creating a target index array.
-    
-    # 1. Get cumulative sum of repeats to know where each block starts
-    # cumsum -> [2, 3, 6]
-    # end_pos -> [2, 3, 6]
     end_pos = repeats_var.cumsum(0)
-    # start_pos -> [0, 2, 3]
     start_pos = end_pos - repeats_var
 
-    # 2. Create the index array
     total_len = repeats_var.sum().item()
     indices = jt.zeros(total_len, dtype='int32')
     
-    # This loop is on CPU and creates ops, it's not a differentiable part of the graph itself.
     for i in range(input.shape[dim]):
         s = start_pos[i].item()
         e = end_pos[i].item()
@@ -295,58 +235,20 @@ class PolygonGCN(nn.Module):
         
         feature_dim = int(x.shape[-1])
         
-        # --- Start of change ---
-        # 创建一个索引，用于将扁平的 x 映射到批处理后的位置
-        # cum_counts: [0, count_0, count_0+count_1, ...]
         cum_counts = jt.concat([jt.zeros(1, dtype=batch_counts.dtype), batch_counts.cumsum(0)], dim=0)
         
-        # 为每个 batch 内的元素创建索引 (0, 1, 2, ...)
         inner_batch_indices = jt.arange(x.shape[0]) - repeat_interleave(cum_counts[:-1], batch_counts)
         
-        # 创建最终的 batched_data 张量
         batched_data = jt.zeros((batch_size, max_batch_size, feature_dim), dtype=x.dtype)
         
-        # 使用高级索引直接赋值，这会保持梯度
-        # batch 是每个元素所属的 batch_id
-        # inner_batch_indices 是每个元素在 batch 内的 id
         batched_data[batch, inner_batch_indices] = x
         
-        # 创建 padding mask
         range_vec = jt.arange(max_batch_size)
         mask = range_vec < batch_counts.unsqueeze(1)
         paddingMask = jt.full((batch_size, max_batch_size), -inf, dtype='float32')
         paddingMask = paddingMask.masked_fill(mask, 0.0)
-        # --- End of change ---
         
         return batched_data, paddingMask
-    
-            
-    # def paddingToEachBatch(self, x, batch):
-    #     inf = 1e9
-        
-    #     batch_size = int(batch.max().item()) + 1
-    #     batch_counts = bincount(batch)
-    #     max_batch_size = int(batch_counts.max().item())
-        
-    #     feature_dim = int(x.shape[-1])
-        
-    #     range_vec = jt.arange(max_batch_size)  # [max_batch_size]
-    #     range_tensor = range_vec.unsqueeze(0).repeat(batch_size, 1)  # [batch_size, max_batch_size]
-    #     batch_counts_expanded = batch_counts.unsqueeze(1).repeat(1, max_batch_size)  # [batch_size, max_batch_size]
-    #     mask = range_tensor < batch_counts_expanded
-        
-    #     # batched_data: [batch_size, max_batch_size, feature_dim]
-    #     batched_data = jt.zeros((batch_size, max_batch_size, feature_dim), dtype=x.dtype)
-    #     current_idx = 0
-    #     for i in range(batch_size):
-    #         batch_len = int(batch_counts[i].item())
-    #         batched_data[i, :batch_len, :] = x[current_idx:current_idx + batch_len, :]
-    #         current_idx += batch_len
-    #     # paddingMask: [batch_size, max_batch_size]
-    #     paddingMask = jt.ones((batch_size, max_batch_size), dtype='float32') * (-inf)
-    #     paddingMask[mask] = 0.0
-        
-    #     return batched_data, paddingMask
     
     def execute(self, data):
         x, edge_index, batch, area, perm = data.x, data.edge_index, data.batch, data.area, data.perm
@@ -379,11 +281,9 @@ class PolygonGCN(nn.Module):
 
         key_padding_mask = (paddingMask < 0)
         
-        # 转置输入
         batchedX = batchedX.transpose(0, 1)
         x = self.transformer_encoder(batchedX, src_key_padding_mask=key_padding_mask)
         
-        # 转回 [batch_size, max_batch_size, feature_dim]
         x = x.transpose(0, 1)
         
         x = self.att_pool(x, key_padding_mask=key_padding_mask)
