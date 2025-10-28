@@ -498,13 +498,13 @@ if __name__ == '__main__':
     ''' Init Model '''
     
     score = PolygonPackingTransformer(marginal_prob_std_func=marginal_prob_fn)
-    checkpoint_path = CHECKPOINT_DIR / "score_model.pth"
+    #checkpoint_path = CHECKPOINT_DIR / "score_model.pth"
     checkpoint_pickle_path = CHECKPOINT_DIR / "score_model.pkl"
-    if checkpoint_path.exists():
+    if checkpoint_pickle_path.exists():
         score.load(str(checkpoint_pickle_path))
-        print(f"Loaded pretrained weights from {checkpoint_path}")
+        print(f"Loaded pretrained weights from {checkpoint_pickle_path}")
     else:
-        print(f"No pretrained checkpoint found at {checkpoint_path}, initializing from scratch.")
+        print(f"No pretrained checkpoint found at {checkpoint_pickle_path}, initializing from scratch.")
 
     paramToLearn =  list(filter(lambda p: p.requires_grad, score.parameters()))
     optimizer = optim.AdamW(paramToLearn, lr=args.lr, weight_decay=1e-4)
